@@ -1,0 +1,7 @@
+UIO-DMA - DMA support for user-space IO.
+
+UIO-DMA exposes existing DMA API provided by the Linux kernel to
+the user-space applications. It also provides methods for allocating
+and managing memory areas suitable for user-space DMA operations.
+
+FIXME: More details

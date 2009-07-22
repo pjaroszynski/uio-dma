@@ -1,0 +1,61 @@
+# Note that this is NOT a relocatable package
+%define prefix @prefix@
+
+%define version @VERSION@
+%define release 3
+
+%define kver @KVER@
+
+Summary: DMA support for user-space IO
+Name: uio-dma
+Version: %{version}
+Release: %{release}
+License: BSD
+Group: System Environment/Libraries
+Vendor: Max Krasnyansky
+Packager: Max Krasnyansky <maxk@qualcomm.com>
+Requires: glibc >= 2.2.4
+BuildRoot: %{prefix}
+
+%package devel
+Summary: Headers and static libraries for uio-dma
+Version: %{version}
+Release: %{release}
+License: BSD
+Group: Development/Libraries
+Requires: uio-dma
+
+%package kmod
+Summary: Kernel backend for uio-dma library
+Version: %{version}
+Release: %{kver}
+License: GPL
+Group: System Environment/Kernel
+Requires: kernel-%{kver} uio-dma-kmod
+
+%description
+User-space library for allocation and managment of the DMA areas and mappings.
+
+%description devel
+Headers and static libraries for uio-dma
+
+%description kmod
+Kernel backend module for the userspace uio-dma library.
+
+%files
+%defattr(-, root, root)
+%{_libdir}/libuio-dma.so*
+
+%files devel
+%defattr(-, root, root)
+%{_libdir}/libuio-dma.*a
+%{_libdir}/pkgconfig/uio-dma.pc
+%{_includedir}/uio-dma/uio-dma.h
+
+%files kmod
+%defattr(-, root, root)
+/lib/modules/*/*/*.ko
+
+%post kmod
+/bin/echo Running depmod %{kver} ...
+/sbin/depmod -a %{kver}

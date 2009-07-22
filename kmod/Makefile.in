@@ -1,0 +1,30 @@
+ifndef KBUILD_EXTMOD
+
+KDIR = @KDIR@
+
+all: module
+
+module:
+	$(MAKE) -C $(KDIR) M=$(shell pwd) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(shell pwd) clean
+
+install:
+	$(MAKE) -C $(KDIR) INSTALL_MOD_PATH=$(DESTDIR) M=$(shell pwd) modules_install
+
+distdir:
+	cp *.[ch] Makefile.in $(distdir)
+
+distclean:
+real-clean:
+
+else
+
+# -- KBUILD stuff --
+
+obj-m        = uio-dma.o
+
+# --
+
+endif
