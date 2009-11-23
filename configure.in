@@ -30,12 +30,14 @@ AC_ARG_WITH(kernel,
 )
 
 AC_SUBST(KVER)
+AC_SUBST(KVER_RPM)
 if ! test -f $KDIR/include/linux/utsrelease.h; then
 	echo Missing kernel headers
 	exit 1
 fi
 
 KVER=`sed -e 's/.*"\(.*\)"/\1/' $KDIR/include/linux/utsrelease.h`
+KVER_RPM=`echo $KVER | tr -d '-'`
 
 AC_CONFIG_LINKS(include/uio-dma/uio-dma.h:$srcdir/ulib/uio-dma.h)
 

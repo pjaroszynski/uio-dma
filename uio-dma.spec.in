@@ -5,6 +5,7 @@
 %define release 3
 
 %define kver @KVER@
+%define kver_rpm @KVER_RPM@
 
 Summary: DMA support for user-space IO
 Name: uio-dma
@@ -28,10 +29,10 @@ Requires: uio-dma
 %package kmod
 Summary: Kernel backend for uio-dma library
 Version: %{version}
-Release: %{kver}
+Release: %{kver_rpm}
 License: GPL
 Group: System Environment/Kernel
-Requires: kernel-%{kver} uio-dma-kmod
+Requires: kernel = %{kver_rpm}
 
 %description
 User-space library for allocation and managment of the DMA areas and mappings.
