@@ -83,7 +83,8 @@ struct uio_dma_area *uio_dma_alloc(int fd, unsigned int size,
 	struct uio_dma_area *da;
 	struct uio_dma_alloc_req areq;
 	struct uio_dma_free_req freq;
-	int err, i;
+	unsigned int chunk_size;
+	int err;
 
 	da = malloc(sizeof(*da));
 	if (!da)
@@ -99,9 +100,9 @@ struct uio_dma_area *uio_dma_alloc(int fd, unsigned int size,
  	 * We only allocate power of two sized chunks so that we could
  	 * avoid division in uio_dma_addr() function. */
 	err = 0;
-	for (i=1; i < 256; i++) {
-		areq.chunk_count = i;
-		areq.chunk_size  = roundup_po2(size / i);
+	for (chunk_size = roundup_po2(size); chunk_size; chunk_size >>= 1) {
+		areq.chunk_size  = chunk_size;
+		areq.chunk_count = (size + chunk_size - 1) / chunk_size;
 		err = ioctl(fd, UIO_DMA_ALLOC, (unsigned long) &areq);
 		if (!err)
 			break;
