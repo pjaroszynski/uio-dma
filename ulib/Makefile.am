@@ -6,4 +6,4 @@ lib_LTLIBRARIES = libuio-dma.la
 
 INCLUDES = -I$(top_srcdir)/include
 libuio_dma_la_SOURCES = uio-dma.c
-libuio_dma_la_LDFLAGS = -version-info 0:1
+libuio_dma_la_LDFLAGS = -version-info 0:2
