@@ -1,5 +1,5 @@
 /*
-   UIO-DMA kernel back-end 
+   UIO-DMA kernel backend 
    Copyright (C) 2009 Qualcomm Inc. All rights reserved.
    Written by Max Krasnyansky <maxk@qualcommm.com>
 
@@ -49,7 +49,7 @@
 #define VERSION "1.0"
 
 char uio_dma_driver_name[]    = "uio-dma";
-char uio_dma_driver_string[]  = "UIO DMA kernel back-end";
+char uio_dma_driver_string[]  = "UIO DMA kernel backend";
 char uio_dma_driver_version[] = VERSION;
 char uio_dma_copyright[]      = "Copyright (c) 2009 Qualcomm Inc. Written by Max Krasnyansky <maxk@qualcomm.com>";
 
