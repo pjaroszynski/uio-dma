@@ -46,14 +46,36 @@
 #define UIO_DMA_INFO(args...) printk(KERN_INFO "uio-dma: " args)
 #define UIO_DMA_ERR(args...)  printk(KERN_ERR  "uio-dma: " args)
 
-#define VERSION "1.0"
+#define VERSION "2.0"
 
 char uio_dma_driver_name[]    = "uio-dma";
 char uio_dma_driver_string[]  = "UIO DMA kernel backend";
 char uio_dma_driver_version[] = VERSION;
 char uio_dma_copyright[]      = "Copyright (c) 2009 Qualcomm Inc. Written by Max Krasnyansky <maxk@qualcomm.com>";
 
-/* DMA area. Attached to a context. */
+/* List of active devices */
+static struct list_head uio_dma_dev_list;
+static struct mutex     uio_dma_dev_mutex;
+static uint32_t         uio_dma_dev_nextid;
+
+/* 
+ * DMA device.
+ * Holds a reference to 'struct device' and a list of DMA mappings
+ */
+struct uio_dma_device {
+	struct list_head  list;
+	struct list_head  mappings;
+	struct mutex      mutex;
+	atomic_t          refcount;
+	struct device    *device;
+	uint32_t          id;
+};
+
+/*
+ * DMA area.
+ * Describes a chunk of DMAable memory.
+ * Attached to a DMA context.
+ */
 struct uio_dma_area {
 	struct list_head  list;
 	atomic_t          refcount;
@@ -65,15 +87,11 @@ struct uio_dma_area {
 	void             *addr[0];
 };
 
-/* DMA device. Attached to a context */
-struct uio_dma_device {
-	struct list_head  list;
-	struct device    *dev;
-	unsigned int      id;
-	struct list_head  mappings;
-};
-
-/* DMA mapping. Attached to a device. */
+/*
+ * DMA mapping.
+ * Attached to a device.
+ * Holds a reference to an area.
+ */
 struct uio_dma_mapping {
 	struct list_head     list;
 	struct uio_dma_area *area;
@@ -81,167 +99,173 @@ struct uio_dma_mapping {
 	uint64_t             dmaddr[0];
 };
 
-/* UIO DMA context. Belongs to an fd. */
+/*
+ * DMA context. 
+ * Attached to a fd. 
+ */
 struct uio_dma_context {
 	struct mutex      mutex;
 	struct list_head  areas;
-	struct list_head  devices;
-	atomic_t          refcount;
 };
 
-static int uio_dma_open(struct inode *inode, struct file * file);
-static void uio_dma_mapping_del(struct uio_dma_context *uc, 
-		struct uio_dma_device *ud, struct uio_dma_mapping *m);
-
-/* ---- Context ---- */
-
-static struct uio_dma_context * uio_dma_context_get(struct uio_dma_context *uc)
-{
-	atomic_inc(&uc->refcount);
-	return uc;
-}
-
-static void uio_dma_context_put(struct uio_dma_context *uc)
-{
-	if (atomic_dec_and_test(&uc->refcount)) {
-		UIO_DMA_DBG("deleted context %p\n", uc);
-		kfree(uc);
-	}
-}
+static void uio_dma_mapping_del(struct uio_dma_device *ud, struct uio_dma_mapping *m);
 
 /* ---- Devices ---- */
-
-/* 
- * Add new device to the context.
- * Context must be locked.
- */
-static int uio_dma_dev_add(struct uio_dma_context *uc, struct device *dev)
+static void uio_dma_device_lock(struct uio_dma_device *ud)
 {
-	struct uio_dma_device *ud;
-	struct list_head *last;
-	int id;
-
-	/* Find first available id */
-	id = 0;
-	last = &uc->devices;
-	list_for_each_entry(ud, &uc->devices, list) {
-		if (id != ud->id)
-			break;
-		last = &ud->list;
-		id++;
-	}
-
-	ud = kzalloc(sizeof(*ud), GFP_KERNEL);
-	if (!ud)
-		return -ENOMEM;
-
-	INIT_LIST_HEAD(&ud->mappings);
-	ud->id  = id;
-	ud->dev = get_device(dev);
-	list_add(&ud->list, last);
-
-	UIO_DMA_DBG("added device. context %p dev #%d %s\n", uc, id, dev->bus_id);
-	return id;
+	mutex_lock(&ud->mutex);
 }
 
-static struct uio_dma_device * uio_dma_dev_lookup(struct uio_dma_context *uc, int id)
+static void uio_dma_device_unlock(struct uio_dma_device *ud)
+{
+	mutex_unlock(&ud->mutex);
+}
+
+/*
+ * Drop all mappings on this device
+ */
+static void __drop_dev_mappings(struct uio_dma_device *ud)
+{
+	struct uio_dma_mapping *m, *n;
+	list_for_each_entry_safe(m, n, &ud->mappings, list)
+		uio_dma_mapping_del(ud, m);
+}
+
+/*
+ * Free the last reference to the UIO DMA device.
+ * Drops all mappings and releases 'struct device'.
+ */
+static void uio_dma_device_free(struct uio_dma_device *ud)
+{
+	__drop_dev_mappings(ud);
+
+	UIO_DMA_DBG("freed device. %s\n", dev_name(ud->device));
+	put_device(ud->device);
+	kfree(ud);
+}
+
+static struct uio_dma_device *uio_dma_device_get(struct uio_dma_device *ud)
+{
+	atomic_inc(&ud->refcount);
+	return ud;
+}
+
+static void uio_dma_device_put(struct uio_dma_device *ud)
+{
+	if (atomic_dec_and_test(&ud->refcount))
+		uio_dma_device_free(ud);
+}
+
+/*
+ * Lookup UIO DMA device based by id.
+ * Must be called under uio_dma_dev_mutex.
+ * Increments device refcount if found.
+ */
+static struct uio_dma_device* __device_lookup(uint32_t id)
 {
 	struct uio_dma_device *ud;
-	list_for_each_entry(ud, &uc->devices, list) {
+	list_for_each_entry(ud, &uio_dma_dev_list, list) {
 		if (ud->id == id)
-			return ud;
+			return uio_dma_device_get(ud);
 	}
 	return NULL;
 }
 
-static int uio_dma_dev_del(struct uio_dma_context *uc, int id)
+/*
+ * Lookup device by uio dma id.
+ * Caller must drop the reference to the returned
+ * device when it's done with it.
+ */
+static struct uio_dma_device* uio_dma_device_lookup(uint32_t id)
 {
-	struct uio_dma_mapping *m, *n;
-	struct uio_dma_device *ud = uio_dma_dev_lookup(uc, id);
+	struct uio_dma_device *ud;
+	mutex_lock(&uio_dma_dev_mutex);
+	ud = __device_lookup(id);
+	mutex_unlock(&uio_dma_dev_mutex);
+	return ud;
+}
+
+/**
+ * Open UIO DMA device (UIO driver interface).
+ * UIO driver calls this function to allocate new device id 
+ * which can then be used by user space to create DMA mappings.
+ */
+int uio_dma_device_open(struct device *dev, uint32_t *id)
+{
+	struct uio_dma_device *ud = kzalloc(sizeof(*ud), GFP_KERNEL);
+	if (!ud)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&ud->mappings);
+	mutex_init(&ud->mutex);
+	atomic_set(&ud->refcount, 1);
+
+	ud->device = get_device(dev);
+	if (!ud->device) {
+		kfree(ud);
+		return -ENODEV;
+	}
+
+	mutex_lock(&uio_dma_dev_mutex);
+	ud->id = uio_dma_dev_nextid++;
+	list_add(&ud->list, &uio_dma_dev_list);
+	mutex_unlock(&uio_dma_dev_mutex);
+
+	*id = ud->id;
+
+	UIO_DMA_DBG("added device. id %u %s\n", *id, dev_name(dev));
+        return 0;
+}
+EXPORT_SYMBOL(uio_dma_device_open);
+
+/**
+ * Close UIO DMA device (UIO driver interface).
+ * UIO driver calls this function when the device is closed.
+ * All current mappings are destroyed.
+ */
+int uio_dma_device_close(uint32_t id)
+{
+	struct uio_dma_device *ud;
+
+	// This can race with uio_dma_mapping_add(), which is perfectly save. 
+	// Mappings will be cleaned up when uio_dma_mapping_add() releases 
+	// the reference.
+
+	mutex_lock(&uio_dma_dev_mutex);
+	ud = __device_lookup(id);
 	if (!ud) {
-		UIO_DMA_DBG("remove bad devid. context %p dev #%d\n", uc, id);
+		UIO_DMA_DBG("removing bad device. id %u\n", id);
+		mutex_unlock(&uio_dma_dev_mutex);
 		return -ENOENT;
 	}
 
-	/* Delete all mappings */
-	list_for_each_entry_safe(m, n, &ud->mappings, list)
-		uio_dma_mapping_del(uc, ud, m);
-
 	list_del(&ud->list);
-	put_device(ud->dev);
+	uio_dma_device_put(ud);
+	mutex_unlock(&uio_dma_dev_mutex);
 
-	UIO_DMA_DBG("removed device. context %p dev #%d %s\n", uc, id, ud->dev->bus_id);
+	UIO_DMA_DBG("removed device. id %u %s\n", id, dev_name(ud->device));
 
-	kfree(ud);
+	uio_dma_device_put(ud);
 	return 0;
 }
+EXPORT_SYMBOL(uio_dma_device_close);
 
-int uio_dma_register_device(int fd, struct device *dev, struct uio_dma_context **ctx)
-{
-	struct uio_dma_context *uc;
-        struct file *file;
-        int id;
-
-	*ctx = NULL;
-
-        file = fget(fd);
-        if (!file) 
-		return -EBADF;
-
-	if (file->f_op->open != uio_dma_open) {
-		fput(file);
-		return -EBADF;
-	}
-
-	uc = file->private_data;
-	if (!uc)
-		return -EBADFD;
-
-	mutex_lock(&uc->mutex);
-
-	id = uio_dma_dev_add(uc, dev);
-
-	mutex_unlock(&uc->mutex);
-
-	if (id > -1)
-		*ctx = uio_dma_context_get(uc);
-
-        fput(file);
-
-        return id;
-}
-EXPORT_SYMBOL(uio_dma_register_device);
-
-int uio_dma_unregister_device(struct uio_dma_context *uc, int devid)
-{
-        int r;
-
-	mutex_lock(&uc->mutex);
-
-	r = uio_dma_dev_del(uc, devid);
-
-	mutex_unlock(&uc->mutex);
-
-	if (r > -1)
-		uio_dma_context_put(uc);
-
-        return r;
-}
-EXPORT_SYMBOL(uio_dma_unregister_device);
-
-
-/* ---- Areas ---- */ 
+/* ---- Areas ---- */
 static inline struct page *__last_page(void *addr, unsigned long size)
 {
 	return virt_to_page(addr + (PAGE_SIZE << get_order(size)) - 1);
 }
 
-static void uio_dma_area_free(struct uio_dma_context *uc, struct uio_dma_area *area)
+/*
+ * Release DMA area.
+ * Called only after all references to this area have been dropped.
+ */
+static void uio_dma_area_free(struct uio_dma_area *area)
 {
 	struct page *page, *last;
 	int i;
 
-	UIO_DMA_DBG("area free. context %p mmap_offset %lu\n", uc, area->mmap_offset);
+	UIO_DMA_DBG("area free. %p mmap_offset %lu\n", area, area->mmap_offset);
 
 	for (i=0; i < area->chunk_count; i++) {
 		last = __last_page(area->addr[i], area->chunk_size);
@@ -254,9 +278,11 @@ static void uio_dma_area_free(struct uio_dma_context *uc, struct uio_dma_area *a
 	kfree(area);
 }
 
-static struct uio_dma_area *uio_dma_area_alloc(struct uio_dma_context *uc,
-		uint64_t dma_mask, unsigned int memnode, unsigned int cache,
-		unsigned int chunk_size, unsigned int chunk_count)
+/*
+ * Allocate new DMA area.
+ */
+static struct uio_dma_area *uio_dma_area_alloc(uint64_t dma_mask, unsigned int memnode, 
+		unsigned int cache, unsigned int chunk_size, unsigned int chunk_count)
 {
 	struct uio_dma_area *area;
 	struct page *page, *last;
@@ -266,8 +292,8 @@ static struct uio_dma_area *uio_dma_area_alloc(struct uio_dma_context *uc,
 	if (!area)
 		return NULL;
 
-	UIO_DMA_DBG("area alloc. context %p area %p chunk_size %u chunk_count %u\n", 
-		uc, area, chunk_size, chunk_count);
+	UIO_DMA_DBG("area alloc. area %p chunk_size %u chunk_count %u\n", 
+		area, chunk_size, chunk_count);
 
 	gfp = GFP_KERNEL | __GFP_NOWARN;
 	if (dma_mask < DMA_64BIT_MASK) {
@@ -288,7 +314,7 @@ static struct uio_dma_area *uio_dma_area_alloc(struct uio_dma_context *uc,
 		page = alloc_pages_node(memnode, gfp, get_order(chunk_size));
 		if (!page) {
 			area->chunk_count = i;
-			uio_dma_area_free(uc, area);
+			uio_dma_area_free(area);
 			return NULL;
 		}
 
@@ -302,6 +328,22 @@ static struct uio_dma_area *uio_dma_area_alloc(struct uio_dma_context *uc,
 	return area;
 }
 
+static struct uio_dma_area *uio_dma_area_get(struct uio_dma_area *area)
+{
+	atomic_inc(&area->refcount);
+	return area;
+}
+
+static void uio_dma_area_put(struct uio_dma_area *area)
+{
+	if (atomic_dec_and_test(&area->refcount))
+		uio_dma_area_free(area);
+}
+
+/*
+ * Look up DMA area by offset.
+ * Must be called under context mutex.
+ */
 static struct uio_dma_area *uio_dma_area_lookup(struct uio_dma_context *uc, uint64_t offset)
 {
 	struct uio_dma_area *area;
@@ -316,38 +358,33 @@ static struct uio_dma_area *uio_dma_area_lookup(struct uio_dma_context *uc, uint
 	return NULL;
 }
 
-static struct uio_dma_area * uio_dma_area_get(struct uio_dma_context *uc, struct uio_dma_area *area)
-{
-	atomic_inc(&area->refcount);
-	return area;
-}
-
-static void uio_dma_area_put(struct uio_dma_context *uc, struct uio_dma_area *area)
-{
-	if (atomic_dec_and_test(&area->refcount)) {
-		UIO_DMA_DBG("deleted area %p\n", area);
-		uio_dma_area_free(uc, area);
-	}
-}
-
 /* ---- Mappings ---- */
 
-static void uio_dma_mapping_del(struct uio_dma_context *uc, struct uio_dma_device *ud, struct uio_dma_mapping *m)
+/*
+ * Delete DMA mapping.
+ * Must be called under device mutex.
+ */
+static void uio_dma_mapping_del(struct uio_dma_device *ud, struct uio_dma_mapping *m)
 {
 	unsigned int i;
 
-	UIO_DMA_DBG("mapping del. context %p device %s mapping %p area %p\n", uc, ud->dev->bus_id, m, m->area);
+	UIO_DMA_DBG("mapping del. device %s mapping %p area %p\n",
+		dev_name(ud->device), m, m->area);
 
 	for (i=0; i < m->area->chunk_count; i++)
- 		dma_unmap_single(ud->dev, m->dmaddr[i], m->area->chunk_size, m->direction);
+ 		dma_unmap_single(ud->device, m->dmaddr[i], m->area->chunk_size, m->direction);
 	list_del(&m->list);
-	uio_dma_area_put(uc, m->area);
+
+	uio_dma_area_put(m->area);
 	kfree(m);
 }
 
-static int uio_dma_mapping_add(struct uio_dma_context *uc, struct uio_dma_device *ud,
-					struct uio_dma_area *area, unsigned int dir,
-					struct uio_dma_mapping **map)
+/*
+ * Add new DMA mapping.
+ * Must be called under device mutex.
+ */
+static int uio_dma_mapping_add(struct uio_dma_device *ud, struct uio_dma_area *area, 
+				unsigned int dir, struct uio_dma_mapping **map)
 {
 	struct uio_dma_mapping *m;
 	int i, n, err;
@@ -356,19 +393,19 @@ static int uio_dma_mapping_add(struct uio_dma_context *uc, struct uio_dma_device
 	if (!m)
 		return -ENOMEM;
 
-	UIO_DMA_DBG("maping add. context %p device %s area %p chunk_size %u chunk_count %u\n",
-			uc, ud->dev->bus_id, area, area->chunk_size, area->chunk_count);
+	UIO_DMA_DBG("maping add. device %s area %p chunk_size %u chunk_count %u\n",
+			dev_name(ud->device), area, area->chunk_size, area->chunk_count);
 
-	m->area      = uio_dma_area_get(uc, area);
+	m->area      = uio_dma_area_get(area);
 	m->direction = dir;
 	for (i=0; i < area->chunk_count; i++) {
-        	m->dmaddr[i] = dma_map_single(ud->dev, area->addr[i], area->chunk_size, dir);
+        	m->dmaddr[i] = dma_map_single(ud->device, area->addr[i], area->chunk_size, dir);
         	if (!m->dmaddr[i]) {
 			err = -EBADSLT;
 			goto failed;
 		}
-		UIO_DMA_DBG("maped. context %p device %s area %p chunk #%u dmaddr %llx\n",
-				uc, ud->dev->bus_id, area, i,
+		UIO_DMA_DBG("maped. device %s area %p chunk #%u dmaddr %llx\n",
+				dev_name(ud->device), area, i,
 				(unsigned long long) m->dmaddr[i]);
 	}
 
@@ -379,35 +416,53 @@ static int uio_dma_mapping_add(struct uio_dma_context *uc, struct uio_dma_device
 
 failed:
 	for (n = 0; n < i; n++)
- 		dma_unmap_single(ud->dev, m->dmaddr[n], m->area->chunk_size, dir);
+ 		dma_unmap_single(ud->device, m->dmaddr[n], m->area->chunk_size, dir);
+	uio_dma_area_put(m->area);
 	kfree(m);
-	uio_dma_area_put(uc, area);
 	return err;
 }
 
-static struct uio_dma_mapping *uio_dma_mapping_lookup(struct uio_dma_context *uc, 
-		struct uio_dma_device *ud, uint64_t offset)
+/*
+ * Look up DMA mapping by area and direction.
+ * Must be called under device mutex.
+ */
+static struct uio_dma_mapping *uio_dma_mapping_lookup(
+		struct uio_dma_device *ud, struct uio_dma_area *area,
+		unsigned int dir)
 {
 	struct uio_dma_mapping *m;
 
-	UIO_DMA_DBG("mapping lookup. context %p device %s offset %llu\n", 
-				uc, ud->dev->bus_id, (unsigned long long) offset);
+	UIO_DMA_DBG("mapping lookup. device %s area %p dir %u\n",
+				dev_name(ud->device), area, dir);
 
 	list_for_each_entry(m, &ud->mappings, list) {
-		if (m->area->mmap_offset == offset)
+		if (m->area == area && m->direction == dir)
 			return m;
 	}
 
 	return NULL;
 }
 
+/* ---- Context ---- */
+static void uio_dma_context_lock(struct uio_dma_context *uc)
+{
+	mutex_lock(&uc->mutex);
+}
+
+static void uio_dma_context_unlock(struct uio_dma_context *uc)
+{
+	mutex_unlock(&uc->mutex);
+}
+
 /* ---- User interface ---- */
 
 /*
  * Make sure new area (offset & size) does not everlap with
- * existing areas and return list_head to append new area to.
+ * the existing areas and return list_head to append new area to.
+ * Must be called under context mutex.
  */
-static struct list_head *append_to(struct uio_dma_context *uc, uint64_t *offset, unsigned int size)
+static struct list_head *append_to(struct uio_dma_context *uc, 
+					uint64_t *offset, unsigned int size)
 {
 	unsigned long start, end, astart, aend;
 	struct uio_dma_area *area;
@@ -470,7 +525,7 @@ static int uio_dma_cmd_alloc(struct uio_dma_context *uc, void __user *argp)
 	if (!where)
 		return -EBUSY;
 
-	area = uio_dma_area_alloc(uc, req.dma_mask, req.memnode, req.cache, req.chunk_size, req.chunk_count);
+	area = uio_dma_area_alloc(req.dma_mask, req.memnode, req.cache, req.chunk_size, req.chunk_count);
 	if (!area)
 		return -ENOMEM;
 
@@ -480,7 +535,7 @@ static int uio_dma_cmd_alloc(struct uio_dma_context *uc, void __user *argp)
 
 	if (copy_to_user(argp, &req, sizeof(req))) {
 		list_del(&area->list);
-		uio_dma_area_put(uc, area);
+		uio_dma_area_put(area);
 		return EFAULT;
 	}
 
@@ -505,7 +560,7 @@ static int uio_dma_cmd_free(struct uio_dma_context *uc, void __user *argp)
 		return -ENOENT;
 
 	list_del(&area->list);
-	uio_dma_area_put(uc, area);
+	uio_dma_area_put(area);
 
 	return 0;
 }
@@ -514,22 +569,14 @@ static int uio_dma_cmd_map(struct uio_dma_context *uc, void __user *argp)
 {
 	struct uio_dma_map_req req;
 	struct uio_dma_mapping *m;
-	struct uio_dma_device *ud;
 	struct uio_dma_area *area;
+	struct uio_dma_device *ud;
 	int err;
 
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 
 	UIO_DMA_DBG("map req. context %p offset %llu devid %u\n", uc, req.mmap_offset, req.devid);
-
-	ud = uio_dma_dev_lookup(uc, req.devid);
-	if (!ud)
-		return -ENODEV;
-
-	m = uio_dma_mapping_lookup(uc, ud, req.mmap_offset);
-	if (m)
-		return -EALREADY;
 
 	area = uio_dma_area_lookup(uc, req.mmap_offset);
 	if (!area)
@@ -538,13 +585,24 @@ static int uio_dma_cmd_map(struct uio_dma_context *uc, void __user *argp)
 	if (req.chunk_count < area->chunk_count)
 		return -EINVAL;
 
-	err = uio_dma_mapping_add(uc, ud, area, req.direction, &m);
+	ud = uio_dma_device_lookup(req.devid);
+	if (!ud)
+		return -ENODEV;
+	uio_dma_device_lock(ud);
+
+	m = uio_dma_mapping_lookup(ud, area, req.direction);
+	if (m) {
+		err = -EALREADY;
+		goto out;
+	}
+
+	err = uio_dma_mapping_add(ud, area, req.direction, &m);
 	if (err)
-		return err;
+		goto out;
 
 	req.chunk_count = area->chunk_count;
 	req.chunk_size  = area->chunk_size;
-		
+
 	if (copy_to_user(argp, &req, sizeof(req)))
 		goto fault;
 
@@ -552,34 +610,50 @@ static int uio_dma_cmd_map(struct uio_dma_context *uc, void __user *argp)
 	if (copy_to_user(argp + sizeof(req), m->dmaddr, sizeof(uint64_t) * area->chunk_count))
 		goto fault;
 
-	return 0;
+	err = 0;
+	goto out;
 
 fault:
-	uio_dma_mapping_del(uc, ud, m);
-	return EFAULT;
+	err = EFAULT;
+	uio_dma_mapping_del(ud, m);
+out:
+	uio_dma_device_unlock(ud);
+	uio_dma_device_put(ud);
+	return err;
 }
 
 static int uio_dma_cmd_unmap(struct uio_dma_context *uc, void __user *argp)
 {
 	struct uio_dma_unmap_req req;
-	struct uio_dma_device *ud;
+	struct uio_dma_area *area;
 	struct uio_dma_mapping *m;
+	struct uio_dma_device *ud;
+	int err;
 
 	if (copy_from_user(&req, argp, sizeof(req)))
 		return -EFAULT;
 
 	UIO_DMA_DBG("map req. context %p offset %llu devid %u\n", uc, req.mmap_offset, req.devid);
 
-	ud = uio_dma_dev_lookup(uc, req.devid);
-	if (!ud)
-		return -ENODEV;
-
-	m = uio_dma_mapping_lookup(uc, ud, req.mmap_offset);
-	if (!m)
+	area = uio_dma_area_lookup(uc, req.mmap_offset);
+	if (!area)
 		return -ENOENT;
 
-	uio_dma_mapping_del(uc, ud, m);
-	return 0;
+	ud = uio_dma_device_lookup(req.devid);
+	if (!ud)
+		return -ENODEV;
+	uio_dma_device_lock(ud);
+
+	err = -ENOENT;
+	m = uio_dma_mapping_lookup(ud, area, req.direction);
+	if (m) {
+		uio_dma_mapping_del(ud, m);
+		err = 0;
+	}
+
+	uio_dma_device_unlock(ud);
+	uio_dma_device_put(ud);
+	return err;
 }
 
 static long uio_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -592,7 +666,7 @@ static long uio_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 	if (!uc)
 		return -EBADFD;
 
-	mutex_lock(&uc->mutex);
+	uio_dma_context_lock(uc);
 
 	switch (cmd) {
 	case UIO_DMA_ALLOC:
@@ -616,25 +690,29 @@ static long uio_dma_ioctl(struct file *file, unsigned int cmd, unsigned long arg
 		break;
 	};
 
-	mutex_unlock(&uc->mutex);
-
+	uio_dma_context_unlock(uc);
 	return err;
+}
+
+static void __drop_ctx_areas(struct uio_dma_context *uc)
+{
+	struct uio_dma_area *area, *n;
+	list_for_each_entry_safe(area, n, &uc->areas, list)
+		uio_dma_area_put(area);
 }
 
 static int uio_dma_close(struct inode *inode, struct file *file)
 {
 	struct uio_dma_context *uc = file->private_data;
-	struct uio_dma_area *area, *n;
 	if (!uc)
 		return 0;
 
 	UIO_DMA_DBG("closed context %p\n", uc);
 
-	list_for_each_entry_safe(area, n, &uc->areas, list)
-		uio_dma_area_put(uc, area);
+	__drop_ctx_areas(uc);
 
 	file->private_data = NULL;
-	uio_dma_context_put(uc);
+	kfree(uc);
 	return 0;
 }
 
@@ -643,15 +721,12 @@ static int uio_dma_open(struct inode *inode, struct file * file)
 	struct uio_dma_context *uc;
 	
 	/* Allocate new context */
-	uc = kmalloc(sizeof(*uc), GFP_KERNEL);
+	uc = kzalloc(sizeof(*uc), GFP_KERNEL);
 	if (!uc)
 		return -ENOMEM;
-	memset(uc, 0, sizeof(*uc));
 
 	mutex_init(&uc->mutex);
 	INIT_LIST_HEAD(&uc->areas);
-	INIT_LIST_HEAD(&uc->devices);
-	atomic_set(&uc->refcount, 1);
 
 	file->private_data = uc;
 
@@ -708,7 +783,7 @@ static int uio_dma_mmap(struct file *file, struct vm_area_struct *vma)
 	int i;
 
 	if (!uc)
-		return -ENODEV;
+		return -EBADFD;
 
 	UIO_DMA_DBG("mmap. context %p start %lu size %lu offset %lu\n", uc, start, size, offset);
 
@@ -770,6 +845,9 @@ static struct miscdevice uio_dma_miscdev = {
 static int __init uio_dma_init_module(void)
 {
 	int err;
+
+	INIT_LIST_HEAD(&uio_dma_dev_list);
+	mutex_init(&uio_dma_dev_mutex);
 
 	printk(KERN_INFO "%s - version %s\n", uio_dma_driver_string, uio_dma_driver_version);
 	printk(KERN_INFO "%s\n", uio_dma_copyright);

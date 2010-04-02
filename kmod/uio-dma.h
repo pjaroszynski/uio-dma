@@ -27,10 +27,8 @@
 
 /* kernel interfaces */
 
-struct uio_dma_context;
-
-int uio_dma_register_device(int fd, struct device *dev, struct uio_dma_context **uc);
-int uio_dma_unregister_device(struct uio_dma_context *uc, int devid);
+int uio_dma_device_open(struct device *dev, uint32_t *devid);
+int uio_dma_device_close(uint32_t devid);
 
 /* ioctl defines */
 
@@ -68,9 +66,8 @@ struct uio_dma_free_req {
 struct uio_dma_map_req {
 	uint64_t mmap_offset;
 	uint32_t flags;
-	uint16_t devid;
+	uint32_t devid;
 	uint8_t  direction;
-	uint8_t  unused;
 	uint32_t chunk_count;
 	uint32_t chunk_size;
 	uint64_t dmaddr[0];
@@ -79,8 +76,9 @@ struct uio_dma_map_req {
 #define UIO_DMA_UNMAP _IOW('U', 203, int)
 struct uio_dma_unmap_req {
 	uint64_t mmap_offset;
-	uint16_t devid;
+	uint32_t devid;
 	uint32_t flags;
+	uint8_t  direction;
 };
 
 #endif /* UIO_DMA_H */

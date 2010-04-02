@@ -87,7 +87,8 @@ struct uio_dma_mapping {
 	unsigned long size;
 	unsigned int  chunk_count;
 	unsigned int  chunk_shift;
-	unsigned int  devid;
+	uint32_t      devid;
+	uint8_t       direction;
 	uint64_t      dmaddr[0];
 };
 
@@ -128,7 +129,7 @@ int uio_dma_free(int fd, struct uio_dma_area *a);
  * @param dir direction
  * @return pointer to new @see uio_dma_mapping
  */
-struct uio_dma_mapping * uio_dma_map(int fd, struct uio_dma_area *area, unsigned int devid, unsigned int dir);
+struct uio_dma_mapping * uio_dma_map(int fd, struct uio_dma_area *area, uint32_t devid, unsigned int dir);
 
 /**
  * Unmap DMA area from a device.

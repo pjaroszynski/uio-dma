@@ -179,6 +179,7 @@ struct uio_dma_mapping *uio_dma_map(int fd, struct uio_dma_area *area,
 		goto failed;
 
 	m->devid = devid;
+	m->direction = dir;
 	m->size = area->size;
 	m->chunk_count = area->chunk_count;
 	m->chunk_shift = ulog2(area->chunk_size);
@@ -202,6 +203,7 @@ int uio_dma_unmap(int fd, struct uio_dma_mapping *m)
 
 	ureq.mmap_offset = m->mmap_offset;
 	ureq.devid = m->devid;
+	ureq.direction = m->direction;
 	ureq.flags = 0;
 	if (ioctl(fd, UIO_DMA_UNMAP, (unsigned long) &ureq) < 0)
 		return -1;
