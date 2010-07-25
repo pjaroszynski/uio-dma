@@ -23,7 +23,7 @@ else
 
 # -- KBUILD stuff --
 
-obj-m        = uio-dma.o
+obj-m        = uio-dma.o uio-dma-pci.o
 
 # --
 
