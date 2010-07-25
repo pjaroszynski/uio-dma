@@ -37,6 +37,8 @@
 
 #include "uio-dma.h"
 
+#define DBG
+
 #ifdef DBG
 #define UIO_DMA_DBG(args...) printk(KERN_DEBUG "uio-dma: " args)
 #else
